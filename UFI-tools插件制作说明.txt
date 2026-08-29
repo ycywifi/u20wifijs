@@ -1,0 +1,420 @@
+UFI-TOOLS 插件开发 · 技术知识库（拆分交付版 · 文件 1/5）
+============================================================
+机型：FM_U20（展锐 T158，内核 64 位 / 系统 32 位）
+整理日期：2026-08-29
+用途：沉淀本项目掌握的全部平台信息，供后续再写插件时复用
+
+
+【文档结构导航】
+  第 1 章：平台本质与插件格式（最关键的入门认知）  → 文件 2
+  第 2 章：运行时环境与全局 API（写逻辑时查）       → 文件 2
+  第 3 章：后端 REST API 清单（调接口时查）         → 文件 3
+  第 4 章：短信转发 / 推送渠道机制（做通知时查）    → 文件 3
+  第 5 章：7×24 常驻与守护进程（做后台任务时查）    → 文件 4
+  第 6 章：完整踩坑与避坑清单（出错时查）           → 文件 4
+  第 7 章：AI Prompt 模板（让我写新插件时用）       → 文件 5
+  附录 A：本会话最终架构共识                        → 文件 5
+
+
+【阅读建议】
+⚠️ 第一次先读文件 2（第1章）和 文件 4（第6章）建立认知；
+   实际写插件时，把 文件5 的 Prompt 模板直接发给我，并附上全部 txt，
+   即可跳过大量平台规则解释。
+
+
+【核心认知（一句话版）】
+✅ 插件不是 .js 文件，而是「一段 HTML 文本」，CSS 放 <style>、JS 放 <script>
+✅ 框架 DOMParser 只提取 style/link/meta/script 四类标签
+✅ 推送最终走 PushPlus 邮件（channel=mail），绕开本机 API 的 kano-sign 鉴权（始终 401）
+✅ 后台常驻靠「前端生成 shell + runShellWithRoot 写入 /sdcard + 自启钩子」
+
+文件 2/5 —— 第 1 章：平台本质与插件格式 / 第 2 章：运行时环境与全局 API
+
+
+============================================================
+第 1 章：平台本质与插件格式
+============================================================
+
+1.1 UFI-TOOLS 是什么
+--------------------
+UFI-TOOLS 是随身 WiFi（本例 FM_U20）的管理后台增强工具，运行在设备
+内部 HTTP 服务上，默认访问地址 http://设备IP:2333，通过浏览器 WebUI
+操作。提供「功能模块 / 插件 / 定时任务 / 高级功能（Root Shell）」入口。
+
+  • 核心服务：设备端 HTTP 服务，端口 2333
+  • 访问方式：浏览器直连局域网 IP，或经 cpolar 等公网隧道（https）
+  • 鉴权：几乎所有后端 API 需请求头（Authorization / kano-sign / kano-t），
+    由前端 common_headers() 自动生成
+
+1.2 插件的真实本质（最重要）
+--------------------------
+【核心认知】插件不是「一个 .js 文件」，而是「一段 HTML 文本」。导入后
+被注入管理后台页面，随页面加载执行。
+
+⚠️ 本项目最大坑：最初把裸 IIFE 当插件内容，导入后页面毫无反应——
+   框架根本不执行它。
+
+◆ 注入机制（main.js 片段）：
+    const doc = parser.parseFromString(head_text, 'text/html');
+    doc.querySelectorAll('style, link, meta').forEach(el => document.head.appendChild(el));
+    doc.querySelectorAll('script').forEach(s => document.head.appendChild(newScript));
+
+◆ 格式铁律：
+  • DOMParser 只提取 <style>/<link>/<meta>/<script> 四类标签
+  • 顶层 <div>、裸 JS 不会被注入，等于无效
+  • 插件必须是完整 HTML 片段：CSS 放 <style>，JS 放 <script>，DOM 由 JS 运行时动态创建
+  • <script> 标签必须严格配对，可用正则 /<script/g 数量校验
+
+◆ 标准模板：
+    <!-- 插件标题：xxx -->
+    <style> .my-card { ... } </style>
+    <script>
+    (function(){ 'use strict';
+      // 1. 读取/初始化配置
+      // 2. 创建 UI 卡片并插入页面
+      // 3. 业务逻辑
+    })();
+    </script>
+
+1.3 安装与调试入口
+------------------
+  • 安装：WebUI → 功能模块/插件 → 添加插件 → 粘贴或导入 → 提交 → 刷新
+  • 调试：F12 → Console（JS 报错）+ Network（接口请求）+ 高级功能 Root Shell
+  • 验证格式：导入后页面应出现 UI；若无任何痕迹，99% 是 <script>/<style> 问题
+
+
+============================================================
+第 2 章：运行时环境与全局 API
+============================================================
+
+以下函数/对象由框架注入页面全局，插件可直接调用。
+
+2.1 设备数据与响应式对象
+----------------------
+实时设备数据挂在 window.UFI_DATA（响应式）。做状态卡片直接读它。
+
+    const data = window.UFI_DATA;
+    console.log(data.cpu_temp, data.daily_flow, data.monthly_flow);
+
+  • 常用字段：daily_flow / monthly_flow / cpu_temp / 内存CPU占用 / 电池
+    （键名随版本，先用 Console 打印确认）
+
+2.2 封装好的工具函数
+------------------
+  函数/对象            用途               说明
+  ------------------  -----------------  -------------------------------
+  runShellWithRoot   Root 执行设备命令    与设备端交互的核心通道
+  (cmd)                                  （部署/写文件/读日志）
+  getUFIData()       设备数据快照         兜底数据源
+  postData()         通用 POST 封装       自动带鉴权头
+  reboot()           重启设备             谨慎使用
+  createToast(msg)   轻提示               UI 反馈
+  showModal(...)     弹窗                 非所有版本都有；建议自建+降级 alert
+  createSwitch()     设置项开关 UI        配置表单
+  formatBytes(n)     字节数格式化         流量展示
+  common_headers()   生成鉴权请求头       {Authorization, kano-sign, kano-t, Cookie}
+
+⚠️ runShellWithRoot 返回字段名随版本不同：content/result/stdout/output
+都可能。读取务必多重兜底：
+    (rs.content || rs.result || rs.stdout || rs.output || '')
+
+2.3 前端 fetch 的鉴权封装
+------------------------
+框架重写了 window.fetch，自动附加 Authorization/kano-t/kano-sign。
+插件直接 fetch('/api/xxx', {method, body}) 即可，绝对不要自己实现
+HMAC 签名——那几乎必然鉴权失败。
+
+    fetch('/api/do_forward_msg', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({body, time, from})
+    });
+
+
+文件 3/5 —— 第 3 章：后端 REST API / 第 4 章：短信转发与推送渠道
+
+
+============================================================
+第 3 章：后端 REST API 清单
+============================================================
+基础路径：http://设备IP:2333（设备内简写 127.0.0.1:2333）
+
+3.1 接口一览
+-----------
+  接口路径                方法    用途/备注
+  ----------------------  ------  ----------------------------------
+  /api/do_forward_msg    POST    主动转发消息（第 4 章核心）
+  /api/sms_forward_mail  GET/POST 短信转发-邮件配置（GET 返回明文密码）
+  /api/sms_forward_curl  GET/POST 短信转发-curl/webhook 配置
+  /api/baseDeviceInfo    GET     基础设备信息（温度兜底数据源）
+  /api/root_shell        POST    执行 Root 命令（需高级功能）
+  /api/sms_forward_*     GET/POST 短信转发各类渠道配置
+
+3.2 鉴权头详解（踩坑重灾区）
+---------------------------
+由 common_headers() 生成，真实抓包值：
+
+    authorization: 4d38293479f24a7fcff98b95e0490f2a420016076cacbf51d16da8c936b0f05d
+    content-type: application/json;charset=UTF-8
+    kano-sign: ff698bfde1075617b624d688f37f2ba862cb5a981c6cd9d41c367d34ed6cdbcd
+    kano-t: 1787993363573
+
+  • Authorization：裸 64 位 hex = SHA-256(password)，无 Kano 前缀、无 Base64
+  • kano-t：13 位毫秒时间戳（Date.now()），不是秒
+  • kano-sign：SHA-256(时间戳+路径+body)；拼接顺序/盐值随固件不同，设备端需抓包反推
+  • Cookie：部分接口需要；本项目 do_forward_msg 未带，仅靠前三项
+  • 需带 Origin/Referer，服务端可能校验 referer
+
+⚠️ 设备端（守护进程）直调本机 API 极易 401（难复现 kano-sign）。
+本项目最终放弃设备端直调，改用 PushPlus 公网通道。若确需设备端直调：
+F12 抓包拿真实头 → 用同一 timestamp 在设备端 sha256sum 反推拼接。
+
+3.3 温度字段单位陷阱
+  • UFI_DATA.cpu_temp 单位需实测（可能 ℃，可能 0.1℃）
+  • baseDeviceInfo 常见 res.cpu_temp / 1000（毫摄氏度）
+✅ 最佳实践：温度三级兜底（UFI_DATA → /api/baseDeviceInfo →
+   Root 读 /sys/class/thermal/thermal_zone*/temp），统一换算为 ℃。
+
+3.4 流量采集三级兜底
+------------------
+    // 1) 页面/响应式数据
+    window.UFI_DATA.daily_flow / monthly_flow
+    // 2) Root 命令（安卓）
+    dumpsys netstats --full
+    // 3) sysfs 原始字节（上下行相加）
+    cat /sys/class/net/<iface>/statistics/rx_bytes
+    cat /sys/class/net/<iface>/statistics/tx_bytes
+
+
+============================================================
+第 4 章：短信转发 / 推送渠道机制
+============================================================
+
+4.1 触发链路
+-----------
+原始设计：事件（收到短信）→ 转发引擎 → 按配置渠道发送。
+本项目复用引擎，把「报警日志变化」当触发事件。
+
+官方 v4.0.0 新增主动转发 API：
+    POST /api/do_forward_msg
+    Body: { "body":"...", "time":"<时间戳>", "from":"..." }
+
+  • 不需真收到短信，直接调用转发引擎按当前配置发送
+  • 配置来源：用户在「短信转发」里设的渠道（SMTP/curl/钉钉等）
+  • 勾选「同时转发设备信息」→ 正文含当日/当月流量、CPU 温度等完整数据
+
+4.2 渠道对比与选型（本项目核心结论）
+---------------------------------
+  渠道              能否7×24脱离浏览器   适用场景
+  ----------------  ------------------  ----------------------
+  SMTP(后端JavaMail) 需鉴权(401风险)     已配时可用
+  curl/webhook       可独立,受curl限制    pushplus/Server酱/钉钉/TG
+  钉钉               可独立               企业群通知
+  PushPlus 邮件      可独立 ✅            本项目最终方案
+  PushPlus 微信      可独立 ✅            不想用邮箱时
+
+4.3 关键设备限制
+---------------
+⚠️ 设备 curl 没有 smtp 协议。这是选型分水岭：设备端无法直接发邮件，
+必须走后端（JavaMail，需鉴权）或第三方（PushPlus 等 webhook）。
+
+  • 想发邮件 → 后端 /api/do_forward_msg（受鉴权制约）或 PushPlus 邮件
+
+4.4 PushPlus 邮件渠道（最终方案）
+-------------------------------
+  • 地址：https://www.pushplus.plus/send
+  • 参数：?token=<Token>&channel=mail&webhook=<邮箱>&to=<邮箱>
+  • Body：{ "title":"...", "content":"...", "template":"html" }
+  • 前置：pushplus.plus 注册 → 复制 Token → 绑定并验证邮箱（必须验证）
+  • 优势：公网 HTTPS，设备 curl 直连，脱离浏览器鉴权 → 守护进程 7×24
+
+    pushplus_send() {
+      local token="$PUSHPLUS_TOKEN" mail="$PUSHPLUS_MAIL" title="$1" content="$2"
+      curl -s -X POST "https://www.pushplus.plus/send?token=${token}&channel=mail" \
+        -H "Content-Type: application/json" \
+        -d "{\"title\":\"${title}\",\"content\":\"${content}\",\"template\":\"html\"}"
+    }
+
+
+文件 4/5 —— 第 5 章：7×24 常驻与守护进程 / 第 6 章：踩坑与避坑清单
+
+
+============================================================
+第 5 章：7×24 常驻与守护进程
+============================================================
+需求：关浏览器/关机，监控照样跑。答案：检测逻辑必须跑在设备本机。
+
+5.1 实现原理（来自「设备状态守护.js」逆向）
+-----------------------------------------
+  • 前端生成 shell 脚本（while true; do ... sleep 60; done 循环、
+    采集/判定/锁定/推送）
+  • runShellWithRoot 写入设备持久存储，如 /sdcard/ufi_monitor.sh
+  • 写入自启钩子 /sdcard/ufi_tools_boot.sh，开机自动拉起
+  • 浏览器关闭/关机 → 仍是设备本机 shell 在循环
+
+5.2 守护进程标准结构
+------------------
+    #!/bin/sh
+    # === 配置（部署时前端注入）===
+    DAILY_LIMIT=1; MONTHLY_LIMIT=25; TEMP_LIMIT=35
+    LOG_FILE="/sdcard/ufi_monitor.log"
+    PID_FILE="/sdcard/ufi_monitor.pid"
+
+    # === 单实例锁 ===
+    [ -f "$PID_FILE" ] && kill -0 "$(cat $PID_FILE)" 2>/dev/null && exit 0
+    echo $$ > "$PID_FILE"
+
+    while true; do
+      now=$(date +%s)
+      # 1. 采集流量/温度（三级兜底）
+      # 2. 判定超限 + 免打扰 + 文件标记位锁定
+      # 3. 超限 → pushplus_send（或写本地短信降级）
+      sleep 60
+    done
+
+5.3 稳定性要点（血泪经验）
+------------------------
+  • PID 文件锁 + 单实例：进程已存在直接退出，否则反复拉起→被杀→日志刷「退出」
+  • 配置持久化：守护进程运行时动态读 conf.json；前端双写 localStorage + conf.json
+  • 自启钩子幂等：ufi_tools_boot.sh 用标记文件防重复追加
+  • 锁定用文件标记位（notified_today.txt / notified_month.txt /
+    notified_temp_until.txt），比对日期自动重置，不依赖页面内存
+  • 采集/判定/推送各环都写日志 → 便于「查看日志」弹窗定位
+  • 降级：推送失败 → 写本地短信到收件箱，告警不丢失
+
+5.4 配置与部署通道
+----------------
+  • runShellWithRoot 设备端执行命令（写文件/起进程/读日志），带 Root 权限
+  • 部署流程：测试通道(echo ok) → 写脚本 → 写后回读字节数 → 启动 → ps 回读 PID
+
+⚠️ 绝不在守护脚本里硬编码「浏览器才能拿到的东西」（登录态、动态签名）。
+守护进程必须自包含：配置明文注入、推送走公网通道、采集用 Root 命令。
+
+
+============================================================
+第 6 章：完整踩坑与避坑清单
+============================================================
+（按「症状 → 根因 → 解决」组织，出错时对照排查）
+
+6.1 导入 / 显示类
+  • 页面无任何痕迹 → 检查 <script>/<style> 包裹、标签配对、顶层裸 <div>
+  • 按钮点了没反应 → 依赖了不存在的全局函数（如 showModal）；弹窗自建 + 降级 alert
+
+6.2 鉴权 / 推送类（最久的坑）
+  • API 始终 401 → kano-sign 不确定；抓包反推或改用 PushPlus
+  • Authorization 前缀错 → 裸 hex，不加 Kano/Basic
+  • 时间戳单位错 → kano-t 是毫秒（13 位），不是秒
+  • 仅浏览器能推、关页面就停 → 推送下沉到守护进程 curl
+
+6.3 部署 / 运行类
+  • ReferenceError: XXX_LIMIT is not defined → 作用域 bug；从 cfg 取值 (parseFloat(c.xxx)||0)
+  • 限额全 0 / 配置丢失 → 读取键名不匹配；三重兜底 + 运行时读 conf.json
+  • 进程反复启停、日志刷「退出」→ 缺 PID 文件锁；加单实例锁
+  • 自启脚本越积越长 → 钩子不幂等；用标记文件防重复
+
+6.4 采集 / 数据类
+  • 温度「未知」→ 机型不导出传感器；三级取数，没有则降级
+  • 数值单位错 → 确认字节/MB、℃/0.1℃；统一换算层
+  • runShellWithRoot 取不到值 → 字段名多重兜底
+
+6.5 通用开发纪律
+  • 写文件/起进程 → 写后回读 / ps 回读，不只信返回码
+  • 日志分区结构化（进程状态/最近N行/推送记录/锁定标记）
+  • 配置热重启使其生效
+  • 敏感信息（authorization=SHA-256(password)）勿贴公开处；测试完改密码
+
+
+文件 5/5 —— 第 7 章：AI Prompt 模板 / 附录 A：最终架构共识
+
+
+============================================================
+第 7 章：AI Prompt 模板（让我写新插件时直接用）
+============================================================
+下次找我写插件时，把模板复制、填空后发给我，并附上这 5 个 txt 文件。
+我可以跳过平台规则解释，直接产出合规代码。
+
+7.1 首次创建插件
+---------------
+    我要在 UFI-TOOLS（随身 WiFi 管理后台，默认 http://设备IP:2333）
+    上写一个插件。
+    机型：FM_U20（展锐 T158，内核64位/系统32位），已开启高级功能。
+
+    【功能需求】
+    （描述你要做什么，例如：每 60 秒检测 XX，超限后 XX）
+
+    【技术要求，请严格遵守】
+    1. 插件必须是 HTML 片段格式：CSS 放 <style>，JS 放 <script>，
+       DOM 由 JS 动态创建——DOMParser 只提取 script/style/link/meta
+       四类标签，裸 JS 或顶层 <div> 会被忽略。
+    2. JS 用 IIFE 包裹，严格模式，<script> 标签严格配对。
+    3. 可用框架全局：runShellWithRoot(cmd)、getUFIData()、postData()、
+       createToast()、formatBytes()、window.UFI_DATA。弹窗不依赖
+       showModal，自建并降级 alert。
+    4. 调后端接口用 fetch('/api/xxx') 让框架自动鉴权，不要自己实现
+       kano-sign/HMAC。
+    5. 鉴权头：Authorization 是裸 64 位 hex（无 Kano 前缀），
+       kano-t 是 13 位毫秒时间戳。
+    6. 后台常驻用「前端生成 shell + runShellWithRoot 写入 /sdcard +
+       自启钩子 ufi_tools_boot.sh」守护进程模式，加 PID 文件锁。
+    7. 推送如需脱离浏览器，走 PushPlus 公网通道
+       （https://www.pushplus.plus/send，channel=mail 可发邮件），
+       因为设备 curl 没有 smtp、本机 API 有鉴权签名。
+    8. 配置持久化（localStorage + conf.json 双写），读取多重兜底。
+
+    【参考】详细平台知识见附件 01~05 这 5 个 txt 文件。
+
+7.2 排错 / 迭代已有插件
+---------------------
+    我有一个 UFI-TOOLS 插件（机型 FM_U20，已开高级功能），出现以下问题：
+    - 现象：（页面不显示 / 按钮无反应 / 部署失败 / 推送 401 /
+            关浏览器就停 / ...）
+    - 我已排查：（F12 Console 报错、Network 请求、查看日志内容，
+                附截图或文本）
+    - 平台规则与可用 API 见附件知识库 文件2(第2章)、文件3(第3章)、
+      文件4(第6章)。
+
+    请先根据知识库定位根因，再给出定点修复（只改相关行并说明理由）。
+
+7.3 一句话快速上手
+  「写/改一个 UFI-TOOLS 插件，机型 FM_U20、已开高级功能，插件格式
+   和可用 API 按附件知识库来，功能需求如下：……」
+
+
+============================================================
+附录 A：本会话最终架构共识（2026-08-29 达成）
+============================================================
+
+A.1 推送渠道最终选型
+  【结论】用 PushPlus 邮件渠道（channel=mail），设备端 curl 直连
+  https://www.pushplus.plus/send，彻底绕开本机 API 的 kano-sign 鉴权
+  （始终 401，设备端无法可靠复现）。
+
+    ✅ 公网 HTTPS，设备 curl 畅通，守护进程可独立 7×24 推送
+    ✅ 收件方式：邮箱（pushplus.plus 绑定并验证邮箱）
+    ❌ 不走微信（用户明确只想邮箱看告警）
+
+A.2 已验证的事实（勿重新求证）
+  • /api/do_forward_msg 经浏览器 fetch（带登录态）可发 SMTP 邮件
+    （图4/图7 实证），但设备端直调因 kano-sign 一律 401
+  • 设备 curl 无 smtp 协议 → 不能设备端直接发邮件
+  • authorization = SHA-256(password) 裸 64 位 hex
+  • kano-t = 13 位毫秒时间戳
+  • FM_U20 部分机型温度传感器缺失 → 三级取数兜底
+
+A.3 完整可复用文件
+  • 设备监测消息推送.js —— 最终版插件（PushPlus 邮件 + 守护进程）
+  • UFI-TOOLS插件编写与AI辅助指南.md —— 早期规范指南
+  • 01~05 这 5 个 txt —— 本知识库拆分交付版
+
+A.4 后续验证优先项
+  1. 导入插件 → 填 PushPlus Token + 限额 → 保存
+  2. 【测试推送】→ 邮箱立即收到告警邮件（页面开着）
+  3. 【部署 7×24 守护】→ 卡片显示 ● 运行中 PID=xxx
+  4. 关闭浏览器 2 分钟 → 温度超限 → 邮箱收到邮件（真 7×24 成功）
+  ★ 终极判定标准：第 4 步是否收到邮件
+
+
+============================================================
+（全文完 · 共 5 个文件：01_封面与说明 / 02_第1-2章 / 03_第3-4章 /
+ 04_第5-6章 / 05_第7章与附录）
+============================================================
