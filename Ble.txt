@@ -1,0 +1,39 @@
+class BleScanService : Service() {
+    companion object {
+        const val TAG = "UFI_BLE"
+        // ATC1441 广播：Service Data, 16-bit UUID 0x181A
+        val UUID_181A = ParcelUuid.fromString("0000181A-0000-1000-8000-00805F9B34FB")
+    }
+
+    private val cb = object : ScanCallback() {
+        override fun onScanResult(type: Int, result: ScanResult) {
+            val d = result.scanRecord?.serviceData?.get(UUID_181A) ?: return
+            if (d.size < 13) return
+            // ATC1441: MAC(6) temp(2,大端有符号) hum(1) batt(1) volt(2) cnt(1)
+            val raw = ((d[6].toInt() and 0xFF) shl 8) or (d[7].toInt() and 0xFF)
+            val temp = (if (raw > 32767) raw - 65536 else raw) / 10.0
+            val hum  = d[8].toInt() and 0xFF
+            val batt = d[9].toInt() and 0xFF
+            val volt = ((d[10].toInt() and 0xFF) shl 8) or (d[11].toInt() and 0xFF)
+            val line = "${System.currentTimeMillis()} ${result.device.address} $temp $hum $batt $volt ${result.rssi}"
+            Log.i(TAG, line)          // 顺带进 logcat，兜底通道
+            append(line)              // 写文件，主通道
+        }
+        override fun onScanFailed(e: Int) { Log.e(TAG, "SCAN_FAILED=$e") }
+    }
+
+    override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+        startForeground(1, notif())
+        val mgr = getSystemService(BluetoothManager::class.java)
+        val scanner = mgr.adapter?.bluetoothLeScanner ?: return START_STICKY
+        val filter = ScanFilter.Builder()
+            .setDeviceAddress("A4:C1:38:XX:XX:XX")   // 换成你的 MAC
+            .build()
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setReportDelay(0)
+            .build()
+        scanner.startScan(listOf(filter), settings, cb)
+        return START_STICKY
+    }
+}
